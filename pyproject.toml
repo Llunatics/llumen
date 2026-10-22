@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llumen"
+version = "1.0.0"
+description = "Fast TLS certificate and HTTP security header analyzer"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Llunatics" }]
+keywords = ["tls", "ssl", "certificate", "security-headers", "easm", "cli"]
+dependencies = [
+    "rich>=13",
+    "cryptography>=41",
+]
+
+[project.scripts]
+llumen = "llumen.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["llumen*"]
