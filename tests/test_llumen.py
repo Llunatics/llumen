@@ -7,11 +7,13 @@ is required.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import socket
 import ssl
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,7 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 from llumen import cli
-from llumen.dns_check import dangling_sans, resolves
+from llumen.dns_check import check_sans, dangling_sans, resolves
 from llumen.header_check import fetch_headers, grade_for_score, grade_headers
 from llumen.targets import Target, TargetError, load_targets, parse_target
 from llumen.tls_probe import parse_certificate, probe_tls
@@ -45,7 +47,7 @@ FULL_PROFILE = {k: v for k, v in FULL_HEADERS.items() if k != "Server"}
 NO_PROFILE = {}
 
 
-def mint_cert(cn, sans, not_before, not_after, key):
+def mint_cert(cn, sans, not_before, not_after, key, ip_sans=None):
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
     builder = (
         x509.CertificateBuilder()
@@ -56,9 +58,13 @@ def mint_cert(cn, sans, not_before, not_after, key):
         .not_valid_before(not_before)
         .not_valid_after(not_after)
     )
-    if sans:
+    if sans or ip_sans:
+        names = [x509.DNSName(s) for s in (sans or [])]
+        names += [
+            x509.IPAddress(ipaddress.ip_address(ip)) for ip in (ip_sans or [])
+        ]
         builder = builder.add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(s) for s in sans]),
+            x509.SubjectAlternativeName(names),
             critical=False,
         )
     return builder.sign(key, hashes.SHA256())
@@ -102,6 +108,34 @@ class HeaderHandler(BaseHTTPRequestHandler):
         pass
 
 
+class RedirectHandler(BaseHTTPRequestHandler):
+    redirect_map = {}  # path -> (status, location)
+    final_profile = FULL_PROFILE
+
+    def _handle(self):
+        route = self.redirect_map.get(self.path)
+        if route is not None:
+            status, location = route
+            self.send_response(status)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        for name, value in self.final_profile.items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(b"ok")
+
+    do_GET = _handle
+    do_HEAD = _handle
+
+    def log_message(self, *args):  # silence
+        pass
+
+
 def make_server(handler_cls, certfile=None):
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     if certfile:
@@ -140,6 +174,18 @@ class FixtureBase(unittest.TestCase):
             ),
             key,
         )
+        cls.cert_ip = write_pem(
+            cls.tmp / "ip.pem",
+            mint_cert(
+                "localhost",
+                ["localhost"],
+                now - timedelta(days=1),
+                now + timedelta(days=90),
+                key,
+                ip_sans=["127.0.0.1"],
+            ),
+            key,
+        )
 
         full = type(
             "Full",
@@ -172,9 +218,83 @@ class FixtureBase(unittest.TestCase):
         cls.port_expired = cls.https_bare_expired.server_address[1]
         cls.port_http = cls.http_head405.server_address[1]
 
+        ip_san = type(
+            "IpSan",
+            (HeaderHandler,),
+            {"profile": FULL_PROFILE, "server_version": "nginx", "sys_version": ""},
+        )
+        cls.https_ip_san = make_server(ip_san, cls.tmp / "ip.pem")
+        cls.port_ip = cls.https_ip_san.server_address[1]
+
+        redirect_rel = type(
+            "RedirectRel",
+            (RedirectHandler,),
+            {
+                "redirect_map": {"/": (301, "/final")},
+                "final_profile": FULL_PROFILE,
+                "server_version": "nginx",
+                "sys_version": "",
+            },
+        )
+        redirect_loop = type(
+            "RedirectLoop",
+            (RedirectHandler,),
+            {
+                "redirect_map": {"/": (302, "/")},
+                "final_profile": FULL_PROFILE,
+                "server_version": "nginx",
+                "sys_version": "",
+            },
+        )
+        redirect_chain = type(
+            "RedirectChain",
+            (RedirectHandler,),
+            {
+                "redirect_map": {
+                    "/": (302, "/c1"),
+                    "/c1": (302, "/c2"),
+                    "/c2": (302, "/c3"),
+                    "/c3": (302, "/c4"),
+                    "/c4": (302, "/c5"),
+                    "/c5": (302, "/c6"),
+                    "/c6": (302, "/final"),
+                },
+                "final_profile": FULL_PROFILE,
+                "server_version": "nginx",
+                "sys_version": "",
+            },
+        )
+        redirect_to_tls = type(
+            "RedirectToTls",
+            (RedirectHandler,),
+            {
+                "redirect_map": {"/": (302, f"https://127.0.0.1:{cls.port_tls}/")},
+                "final_profile": FULL_PROFILE,
+                "server_version": "nginx",
+                "sys_version": "",
+            },
+        )
+        cls.http_redirect_rel = make_server(redirect_rel)
+        cls.http_redirect_loop = make_server(redirect_loop)
+        cls.http_redirect_chain = make_server(redirect_chain)
+        cls.http_redirect_to_tls = make_server(redirect_to_tls)
+        cls.port_redirect_rel = cls.http_redirect_rel.server_address[1]
+        cls.port_redirect_loop = cls.http_redirect_loop.server_address[1]
+        cls.port_redirect_chain = cls.http_redirect_chain.server_address[1]
+        cls.port_redirect_to_tls = cls.http_redirect_to_tls.server_address[1]
+
     @classmethod
     def tearDownClass(cls):
-        for srv in (cls.https_full, cls.https_bare_expired, cls.http_head405):
+        for srv in (
+            cls.https_full,
+            cls.https_bare_expired,
+            cls.http_head405,
+            cls.https_ip_san,
+            cls.http_redirect_rel,
+            cls.http_redirect_loop,
+            cls.http_redirect_chain,
+            cls.http_redirect_to_tls,
+        ):
             srv.shutdown()
 
 
@@ -256,6 +376,12 @@ class TestCertParse(FixtureBase):
         info = parse_certificate(der)
         self.assertLess(info.days_left, 0)
 
+    def test_parse_ip_sans(self):
+        der = self.cert_ip.public_bytes(serialization.Encoding.DER)
+        info = parse_certificate(der)
+        self.assertEqual(info.ip_sans, ["127.0.0.1"])
+        self.assertIn("localhost", info.sans)
+
 
 # --------------------------------------------------------------- TLS probe
 
@@ -267,9 +393,33 @@ class TestTlsProbe(FixtureBase):
         self.assertIn("TLS", result.tls_version)
         self.assertTrue(result.cipher)
         self.assertEqual(result.cert.sans[0], "localhost")
-        self.assertFalse(result.warnings)
+        # No expiry warnings; the IP-SAN warning below is expected (the
+        # fixture cert has DNS SANs only) and covered by its own test.
+        self.assertFalse(
+            any("expir" in w for w in result.warnings), result.warnings
+        )
         # Self-signed must be reported as invalid, separately from extraction.
         self.assertTrue(result.validation.startswith("invalid"), result.validation)
+
+    def test_probe_ip_target_without_ip_san_warns(self):
+        # The fixture cert covers DNS names only — serving it on an IP
+        # literal must be flagged, even though the chain is what fails
+        # validation here (self-signed).
+        result = probe_tls(Target("127.0.0.1", self.port_tls), timeout=3)
+        self.assertTrue(result.ok, result.error)
+        self.assertTrue(
+            any("does not include IP 127.0.0.1" in w for w in result.warnings),
+            result.warnings,
+        )
+
+    def test_probe_ip_target_with_ip_san_no_warning(self):
+        result = probe_tls(Target("127.0.0.1", self.port_ip), timeout=3)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.cert.ip_sans, ["127.0.0.1"])
+        self.assertFalse(
+            any("does not include IP" in w for w in result.warnings),
+            result.warnings,
+        )
 
     def test_probe_expired(self):
         result = probe_tls(Target("127.0.0.1", self.port_expired), timeout=3)
@@ -372,6 +522,39 @@ class TestFetchHeaders(FixtureBase):
         self.assertTrue(result.ok, result.error)
         self.assertEqual(result.scheme, "https")
 
+    def test_redirect_relative_followed(self):
+        result = fetch_headers(
+            Target("127.0.0.1", self.port_redirect_rel), scheme="http"
+        )
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.status, 200)
+        self.assertEqual(result.score, 100)
+        self.assertEqual(result.redirects, 1)
+        self.assertTrue(result.final_url.endswith("/final"), result.final_url)
+
+    def test_redirect_http_to_https_followed(self):
+        result = fetch_headers(
+            Target("127.0.0.1", self.port_redirect_to_tls), scheme="http"
+        )
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.scheme, "https")
+        self.assertEqual(result.score, 100)
+        self.assertEqual(result.redirects, 1)
+
+    def test_redirect_loop_detected(self):
+        result = fetch_headers(
+            Target("127.0.0.1", self.port_redirect_loop), scheme="http"
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("loop", result.error)
+
+    def test_redirect_chain_too_many(self):
+        result = fetch_headers(
+            Target("127.0.0.1", self.port_redirect_chain), scheme="http"
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("too many redirects", result.error)
+
     def test_drip_feed_body_does_not_stall_fetch(self):
         # Regression (audit round 1): the GET fallback used to drain the
         # response body, so a slow-drip server stalled the scan forever.
@@ -435,6 +618,42 @@ class TestDnsCheck(unittest.TestCase):
             )
         self.assertEqual(hints, ["dead.test"])
 
+    def test_resolves_timeout_returns_none(self):
+        # Regression: the stdlib resolver has no timeout, so a hung
+        # resolver used to stall the worker (and the scan) forever.
+        with mock.patch(
+            "llumen.dns_check.socket.getaddrinfo",
+            side_effect=lambda *a, **k: time.sleep(0.5),
+        ):
+            self.assertIsNone(resolves("slow.test", timeout=0.05))
+
+    def test_check_sans_reports_timeouts_separately(self):
+        def fake_getaddrinfo(host, *args, **kwargs):
+            if host == "slow.test":
+                time.sleep(0.5)
+                return [(socket.AF_INET,)]
+            raise socket.gaierror(-2, "NXDOMAIN")
+
+        with mock.patch(
+            "llumen.dns_check.socket.getaddrinfo", side_effect=fake_getaddrinfo
+        ):
+            result = check_sans(
+                ["dead.test", "slow.test"], exclude="x.test", timeout=0.05
+            )
+        self.assertEqual(result.hints, ["dead.test"])
+        self.assertEqual(result.timed_out, ["slow.test"])
+        # The backwards-compatible wrapper drops timeouts — a slow
+        # resolver must never manufacture a dangling hint.
+        with mock.patch(
+            "llumen.dns_check.socket.getaddrinfo", side_effect=fake_getaddrinfo
+        ):
+            self.assertEqual(
+                dangling_sans(
+                    ["dead.test", "slow.test"], exclude="x.test", timeout=0.05
+                ),
+                ["dead.test"],
+            )
+
 
 # --------------------------------------------------------------------- CLI
 
@@ -462,6 +681,8 @@ class TestCli(FixtureBase):
         self.assertTrue(rec["tls"]["ok"])
         self.assertEqual(rec["headers"]["grade"], "A+")
         self.assertIn("localhost", rec["tls"]["cert"]["sans"])
+        self.assertIn("dns_timeouts", rec)
+        self.assertEqual(rec["headers"]["redirects"], 0)
 
     def test_no_valid_targets_returns_2(self):
         self.assertEqual(cli.main(["bad host with spaces"]), 2)

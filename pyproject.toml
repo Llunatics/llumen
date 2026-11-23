@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llumen"
-version = "1.0.0"
+version = "1.1.0"
 description = "Fast TLS certificate and HTTP security header analyzer"
 readme = "README.md"
 license = { text = "MIT" }

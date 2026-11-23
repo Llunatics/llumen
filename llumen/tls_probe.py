@@ -23,11 +23,22 @@ WARN_EXPIRING_30 = "expires in less than 30 days"
 WARN_EXPIRING_7 = "expires in less than 7 days"
 
 
+def ip_san_warning(cert: CertInfo, ip: str) -> str | None:
+    """For an IP-literal target, the certificate must carry that IP in
+    its SAN (as an IPAddress entry) to be valid *for* the target — a
+    chain that verifies says nothing about coverage. Returns a warning
+    when the IP is not covered, else None."""
+    if ip in cert.ip_sans:
+        return None
+    return f"certificate SAN does not include IP {ip}"
+
+
 @dataclass
 class CertInfo:
     subject: str = ""
     issuer: str = ""
     sans: list[str] = field(default_factory=list)
+    ip_sans: list[str] = field(default_factory=list)  # IP literals in the SAN
     not_before: str = ""  # ISO 8601, UTC
     not_after: str = ""  # ISO 8601, UTC
     days_left: int | None = None
@@ -77,8 +88,12 @@ def _parse_with_cryptography(der: bytes) -> CertInfo:
             ExtensionOID.SUBJECT_ALTERNATIVE_NAME
         )
         info.sans = list(san_ext.value.get_values_for_type(x509.DNSName))
+        info.ip_sans = [
+            str(ip) for ip in san_ext.value.get_values_for_type(x509.IPAddress)
+        ]
     except x509.ExtensionNotFound:
         info.sans = []
+        info.ip_sans = []
     try:
         not_before = cert.not_valid_before_utc
         not_after = cert.not_valid_after_utc
@@ -115,6 +130,9 @@ def _parse_with_stdlib(der: bytes) -> CertInfo:
         f"{k}={v}" for rdn in decoded.get("issuer", ()) for k, v in rdn
     )
     info.sans = [v for kind, v in decoded.get("subjectAltName", ()) if kind == "DNS"]
+    info.ip_sans = [
+        v for kind, v in decoded.get("subjectAltName", ()) if kind == "IP Address"
+    ]
     info.serial = str(decoded.get("serialNumber", ""))
     for key, attr in (("notBefore", "not_before"), ("notAfter", "not_after")):
         raw = decoded.get(key)
@@ -213,4 +231,12 @@ def probe_tls(target: Target, timeout: float = 3.0) -> TlsResult:
     result.ok = True
     result.warnings = expiry_warnings(result.cert)
     result.validation = _validate(host, port, timeout, target.is_ip)
+    if target.is_ip:
+        warning = ip_san_warning(result.cert, host)
+        if warning:
+            result.warnings.append(warning)
+            if result.validation == "valid":
+                # The chain verifies, but the certificate is not valid
+                # *for this IP* — say so instead of reporting "valid".
+                result.validation = f"invalid: {warning}"
     return result

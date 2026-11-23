@@ -1,3 +1,80 @@
+# Audit — llumen v1.1.0 (2026-11-23)
+
+Upgrade build closing the three honest limitations admitted in the
+v1.0.0 audit. Verified offline (44/44 tests) plus a fresh-install
+re-run and a live local-server smoke test of the installed CLI.
+
+## What changed
+
+1. **[Fixed] Dangling-SAN check can no longer stall on a resolver.**
+   `resolves()` ran the stdlib `getaddrinfo` with no timeout, so a
+   pathological resolver could hang a worker thread indefinitely
+   (bounded only by the 20-name cap). The lookup now runs in a daemon
+   worker thread and is abandoned after `--dns-timeout` (default: the
+   `--timeout` value). A timed-out lookup is reported separately
+   (`dns_timeouts` in JSON, `? ... timed out` line in plain output) and
+   is *never* flagged as dangling — a slow resolver cannot manufacture
+   false takeover hints. Regression tests: a mocked 0.5 s resolver
+   returns `None` after a 0.05 s timeout, and `check_sans` splits a
+   dead name (hint) from a slow name (timed out).
+2. **[Fixed] Header grading now follows redirects.** The fetch graded
+   the first response, so a bare domain that 301s to its real site was
+   graded on the redirect stub. `fetch_headers` now follows 301/302/
+   303/307/308 (303 switches to GET) up to 5 hops — relative locations
+   resolved via `urljoin`, cross-host and http<->https hops followed,
+   non-HTTP(S) targets rejected — and grades the final response,
+   recording hop count + final URL (`redirects`, `final_url`). Loops
+   and chains over the cap are errors, not grades. Regression tests:
+   relative 301 followed (score 100, 1 redirect), http→https 302
+   followed, self-loop detected, 7-hop chain rejected as too many.
+3. **[Fixed] IP-literal targets now get a SAN coverage check.**
+   Validation used to verify the chain only, so a certificate issued
+   for a DNS name served on a bare IP still read `valid`. Certificates
+   are now parsed for IPAddress SANs (`ip_sans`, both `cryptography`
+   and stdlib paths) and, for IP targets, the probe warns when the SAN
+   does not include the target IP — and if the chain otherwise
+   verifies, validation becomes `invalid: certificate SAN does not
+   include IP <ip>` instead of a misleading `valid`. Regression tests:
+   cert with an IP SAN for 127.0.0.1 parses and probes clean; the
+   DNS-only fixture cert warns on the same IP.
+
+## Verification
+
+- Offline suite: **44/44 OK** (35 carried over + 9 new), run against
+  the working tree and again against a fresh install (clean copy, new
+  venv, `pip install .`, `llumen 1.1.0`).
+- CLI smoke against local servers with the installed binary:
+  http→https redirect graded A+ (100) after 1 hop; IP target without
+  an IP SAN warned `certificate SAN does not include IP 127.0.0.1`;
+  IP target with the IP SAN warned nothing and reported
+  `ip_sans: ["127.0.0.1"]`; `--dns-timeout` accepted, `dns_timeouts`
+  present in JSON.
+- No regressions: all pre-existing tests pass unchanged except
+  `test_probe_valid_selfsigned`, whose `assertFalse(warnings)` now
+  asserts no *expiry* warnings — the IP-SAN warning is the intended
+  new behaviour for that fixture cert and is covered by its own test.
+
+## Honest limitations (updated)
+
+- The dangling-SAN check still depends on the system resolver; a
+  resolver that answers for every name (wildcard DNS, captive
+  portals, intercepting proxies) will suppress hints. A timed-out
+  lookup leaves a daemon worker thread behind until the resolver
+  answers; threads are bounded by the 20-name cap per target.
+- Header grading is presence + basic strength; it is a triage
+  signal, not a security audit.
+- No cipher-suite or protocol-downgrade testing (testssl.sh's job),
+  no crawling, no active enumeration — by design.
+
+## Verdict
+
+v1.1.0 closes the three gaps the v1.0.0 audit admitted, with the same
+offline-first verification discipline. The tool remains a fast,
+batch-safe TLS + header triage aid — not a replacement for testssl.sh
+or a full web security audit.
+
+---
+
 # Audit — llumen v1.0.0 (2026-10-22)
 
 Staged audit performed on the day of the build, in three rounds:

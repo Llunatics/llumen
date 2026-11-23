@@ -14,8 +14,14 @@ from __future__ import annotations
 import http.client
 import ssl
 from dataclasses import dataclass, field
+from urllib.parse import urljoin, urlsplit
 
+from . import __version__
 from .targets import Target
+
+# Redirect statuses worth following (3xx with a Location header).
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+MAX_REDIRECTS = 5
 
 # Rubric (sums to 100)
 POINTS = {
@@ -49,6 +55,8 @@ class HeaderResult:
     score: int | None = None
     grade: str = ""
     findings: list[str] = field(default_factory=list)
+    redirects: int = 0
+    final_url: str | None = None
 
 
 def grade_for_score(score: int) -> str:
@@ -178,7 +186,21 @@ def grade_headers(headers: dict[str, str]) -> tuple[int, list[str]]:
     return score, findings
 
 
-def _request(host: str, port: int, scheme: str, method: str, timeout: float):
+def _url_for(scheme: str, host: str, port: int, path: str = "/") -> str:
+    host = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{host}:{port}{path}"
+
+
+def _request_once(
+    host: str, port: int, scheme: str, method: str, timeout: float, path: str = "/"
+) -> tuple[int, dict[str, str], str | None]:
+    """One request; returns (status, headers, Location or None).
+
+    The response body is never read: only headers are graded, and
+    draining the body would let a hostile or broken server stall the
+    scan indefinitely (slow-drip / endless body); the socket is simply
+    closed in the finally block.
+    """
     if scheme == "https":
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
@@ -189,14 +211,10 @@ def _request(host: str, port: int, scheme: str, method: str, timeout: float):
     try:
         conn.request(
             method,
-            "/",
-            headers={"User-Agent": "llumen/1.0", "Accept": "*/*"},
+            path,
+            headers={"User-Agent": f"llumen/{__version__}", "Accept": "*/*"},
         )
         resp = conn.getresponse()
-        # Deliberately do NOT read the body: only headers are graded.
-        # Draining the body would let a hostile or broken server stall
-        # the scan indefinitely (slow-drip / endless body); the socket
-        # is simply closed in the finally block.
         raw_headers: dict[str, str] = {}
         for name, value in resp.getheaders():
             key = name.lower()
@@ -204,37 +222,94 @@ def _request(host: str, port: int, scheme: str, method: str, timeout: float):
             raw_headers[key] = (
                 f"{raw_headers[key]}, {value}" if key in raw_headers else value
             )
-        return resp.status, raw_headers
+        return resp.status, raw_headers, resp.getheader("Location")
     finally:
         conn.close()
 
 
-def fetch_headers(target: Target, timeout: float = 3.0, scheme: str = "auto") -> HeaderResult:
-    """Fetch and grade headers for one target. Never raises."""
+def fetch_headers(
+    target: Target,
+    timeout: float = 3.0,
+    scheme: str = "auto",
+    max_redirects: int = MAX_REDIRECTS,
+) -> HeaderResult:
+    """Fetch and grade headers for one target, following redirects.
+
+    Redirects (301/302/303/307/308 with a Location header) are followed
+    up to ``max_redirects`` hops; the *final* response is graded and
+    the hop count + final URL are recorded. Relative locations are
+    resolved against the current URL; cross-host and http<->https hops
+    are followed, but only http/https schemes. Redirect loops and
+    over-long chains are reported as errors instead of graded.
+    Never raises for network problems.
+    """
     result = HeaderResult(target=str(target))
     if scheme == "auto":
         scheme = "https" if target.port == 443 else "http"
     result.scheme = scheme
-    try:
-        try:
-            status, headers = _request(target.host, target.port, scheme, "HEAD", timeout)
-            if status in (405, 501):  # HEAD unsupported -> retry with GET
-                status, headers = _request(target.host, target.port, scheme, "GET", timeout)
-        except (http.client.HTTPException, OSError, ssl.SSLError) as exc:
-            if scheme == "https":
-                raise
-            # Plain HTTP failed; the port might still speak TLS.
-            status, headers = _request(target.host, target.port, "https", "HEAD", timeout)
-            if status in (405, 501):
-                status, headers = _request(target.host, target.port, "https", "GET", timeout)
-            result.scheme = "https"
-    except (http.client.HTTPException, OSError, ssl.SSLError) as exc:
-        result.error = f"header fetch failed: {exc}"
-        return result
+    current = _url_for(scheme, target.host, target.port)
+    method = "HEAD"
+    redirects = 0
+    seen: set[str] = set()
+    https_fallback_tried = False
 
-    result.ok = True
-    result.status = status
-    result.headers = headers
-    result.score, result.findings = grade_headers(headers)
-    result.grade = grade_for_score(result.score)
-    return result
+    while True:
+        parts = urlsplit(current)
+        host = parts.hostname or target.host
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        try:
+            status, headers, location = _request_once(
+                host, port, parts.scheme, method, timeout, path
+            )
+        except (http.client.HTTPException, OSError, ssl.SSLError) as exc:
+            # First-hop plain HTTP failed; the port might still speak TLS.
+            if (
+                not https_fallback_tried
+                and redirects == 0
+                and parts.scheme == "http"
+            ):
+                https_fallback_tried = True
+                current = _url_for("https", target.host, target.port)
+                result.scheme = "https"
+                continue
+            result.error = f"header fetch failed: {exc}"
+            return result
+
+        if status in (405, 501) and method == "HEAD":
+            # HEAD unsupported -> retry the same URL with GET.
+            method = "GET"
+            continue
+
+        if status in REDIRECT_STATUSES and location:
+            if redirects >= max_redirects:
+                result.error = f"too many redirects (>{max_redirects})"
+                return result
+            nxt = urljoin(current, location)
+            if urlsplit(nxt).scheme not in ("http", "https"):
+                result.error = (
+                    f"redirect to unsupported scheme: "
+                    f"{urlsplit(nxt).scheme!r}"
+                )
+                return result
+            if nxt in seen:
+                result.error = f"redirect loop detected at {nxt}"
+                return result
+            seen.add(current)
+            current = nxt
+            redirects += 1
+            if status == 303:
+                method = "GET"
+            continue
+
+        result.ok = True
+        result.status = status
+        result.headers = headers
+        result.redirects = redirects
+        result.final_url = current
+        result.scheme = parts.scheme
+        result.score, result.findings = grade_headers(headers)
+        result.grade = grade_for_score(result.score)
+        return result

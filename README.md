@@ -26,7 +26,18 @@ a sanity check on your own fleet, or feeding an EASM inventory.
 - **Passive takeover hints** — SAN hostnames (other than the target itself
   and wildcards) that no longer resolve in DNS are flagged as possible
   dangling names. Passive only: no brute-forcing, no crawling, no active
-  enumeration of any kind.
+  enumeration of any kind. Each lookup is timeout-bound (`--dns-timeout`,
+  default: `--timeout`); a name whose lookup times out is reported
+  separately as unknown and never flagged as dangling, so a slow resolver
+  cannot manufacture false hints.
+- **Redirect-aware header grading** — 301/302/303/307/308 responses are
+  followed (up to 5 hops, loops and over-long chains reported as errors)
+  and the *final* response is graded; the hop count and final URL are
+  recorded in the report.
+- **IP-literal SAN coverage** — for IP targets, llumen now checks that the
+  certificate actually carries the IP in its SAN (as an IPAddress entry).
+  A chain that verifies but does not cover the IP is reported as invalid
+  for that target, with a warning.
 - **Batch-friendly** — one domain or thousands; bounded worker pool,
   per-connection timeouts (dead targets are skipped in seconds), terminal
   table via Rich plus a full JSON report for scripting. Ctrl-C prints the
@@ -81,6 +92,7 @@ IPv6 (`[::1]:8443`), and internationalized names (`bücher.de`).
 | `-f, --file PATH` | — | Read targets from a file, one per line |
 | `--port N` | 443 | Default port for bare hostnames |
 | `--timeout SEC` | 3.0 | Per-connection timeout |
+| `--dns-timeout SEC` | = `--timeout` | Per-name timeout for dangling-SAN DNS lookups |
 | `--scheme auto\|http\|https` | auto | Scheme for the header fetch (auto: https on port 443, else http, with cross-fallback) |
 | `--workers N` | 8 | Parallel workers (max 16) |
 | `--no-dns-check` | off | Skip the passive dangling-SAN check |
@@ -125,13 +137,17 @@ D ≥ 40, F below that. The rubric is a triage signal, not an audit.
   downgrade testing (use testssl.sh), web crawling, active subdomain
   brute-forcing, and third-party takeover fingerprinting. The dangling-SAN
   check is a hint for manual verification, not a takeover verdict.
-- Redirects are not followed for the header fetch; the first response is
-  graded.
-- For IP-literal targets, chain validation runs but hostname verification
-  is skipped (there is no hostname), so `valid` means "chain verifies".
+- Redirects are followed up to 5 hops for the header fetch (loops and
+  longer chains are errors); the final response is graded and the hop
+  count + final URL are recorded. A redirect to a non-HTTP(S) scheme is
+  rejected.
+- For IP-literal targets, chain validation runs and the certificate's SAN
+  is additionally checked for an IPAddress entry covering the target IP;
+  `valid` means "chain verifies *and* the SAN covers this IP".
 - The dangling-SAN check depends on the local resolver; a resolver that
   answers for every name (wildcard DNS, captive portals, intercepting
-  proxies) will suppress hints.
+  proxies) will suppress hints. Lookups that time out are reported as
+  unknown (`dns_timeouts` in JSON), never as dangling.
 - Header grading evaluates presence and basic strength only — it does not
   judge whether a CSP actually stops XSS in a given application.
 

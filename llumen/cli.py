@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 
 from . import __version__
-from .dns_check import dangling_sans
+from .dns_check import check_sans
 from .header_check import fetch_headers
 from .targets import Target, load_targets, parse_target, TargetError
 from .tls_probe import probe_tls
@@ -42,7 +42,13 @@ def _sanitize_obj(obj):
     return obj
 
 
-def scan_target(target: Target, timeout: float, check_dns: bool, scheme: str) -> dict:
+def scan_target(
+    target: Target,
+    timeout: float,
+    check_dns: bool,
+    scheme: str,
+    dns_timeout: float | None = None,
+) -> dict:
     tls = probe_tls(target, timeout=timeout)
     headers = fetch_headers(target, timeout=timeout, scheme=scheme)
     record = {
@@ -52,9 +58,16 @@ def scan_target(target: Target, timeout: float, check_dns: bool, scheme: str) ->
         "tls": asdict(tls),
         "headers": asdict(headers),
         "takeover_hints": [],
+        "dns_timeouts": [],
     }
     if check_dns and tls.cert and tls.cert.sans:
-        record["takeover_hints"] = dangling_sans(tls.cert.sans, exclude=target.host)
+        san_result = check_sans(
+            tls.cert.sans,
+            exclude=target.host,
+            timeout=dns_timeout if dns_timeout is not None else timeout,
+        )
+        record["takeover_hints"] = san_result.hints
+        record["dns_timeouts"] = san_result.timed_out
     return _sanitize_obj(record)
 
 
@@ -88,20 +101,30 @@ def render_plain(records: list[dict]) -> str:
             sans = cert.get("sans") or []
             if sans:
                 lines.append(f"  SANs     : {', '.join(sans)}")
+            ip_sans = cert.get("ip_sans") or []
+            if ip_sans:
+                lines.append(f"  IP SANs  : {', '.join(ip_sans)}")
             for warning in tls.get("warnings", []):
                 lines.append(f"  ! {warning}")
         headers = rec["headers"]
         if headers.get("ok"):
-            lines.append(
+            detail = (
                 f"  Headers  : grade {_grade_cell(rec)} "
                 f"[{headers.get('scheme')} {headers.get('status')}]"
             )
+            if headers.get("redirects"):
+                detail += f" ({headers['redirects']} redirect(s) -> {headers.get('final_url')})"
+            lines.append(detail)
             for finding in headers.get("findings", []):
                 lines.append(f"  - {finding}")
         elif headers.get("error"):
             lines.append(f"  Headers  : {headers['error']}")
         for hint in rec.get("takeover_hints", []):
             lines.append(f"  ? SAN {hint} does not resolve (possible dangling name)")
+        for name in rec.get("dns_timeouts", []):
+            lines.append(
+                f"  ? SAN {name} DNS lookup timed out (unknown — not flagged dangling)"
+            )
         lines.append("")
     return "\n".join(lines)
 
@@ -139,6 +162,7 @@ def render_rich(records: list[dict]) -> None:
             if rec["tls"].get("warnings")
             or rec["headers"].get("findings")
             or rec.get("takeover_hints")
+            or rec.get("dns_timeouts")
             or not rec["tls"].get("ok")
         ]
     )
@@ -164,6 +188,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=3.0,
         help="per-connection timeout in seconds (default: 3.0)",
+    )
+    parser.add_argument(
+        "--dns-timeout",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="per-name timeout for dangling-SAN DNS lookups "
+        "(default: same as --timeout)",
     )
     parser.add_argument(
         "--scheme",
@@ -227,6 +259,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.timeout <= 0:
         print("error: --timeout must be positive", file=sys.stderr)
         return 2
+    if args.dns_timeout is not None and args.dns_timeout <= 0:
+        print("error: --dns-timeout must be positive", file=sys.stderr)
+        return 2
     if not (1 <= args.port <= 65535):
         print("error: --port must be between 1 and 65535", file=sys.stderr)
         return 2
@@ -244,7 +279,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         futures = {
             pool.submit(
-                scan_target, target, args.timeout, not args.no_dns_check, args.scheme
+                scan_target,
+                target,
+                args.timeout,
+                not args.no_dns_check,
+                args.scheme,
+                args.dns_timeout,
             ): target
             for target in targets
         }
