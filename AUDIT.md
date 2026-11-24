@@ -1,3 +1,92 @@
+# Audit — llumen v1.1.1 (2026-11-24, Selasa)
+
+First audit of the v1.1.0 upgrade (built 2026-11-23). Baseline suite
+green first (44/44), then adversarial probes against the three new
+features — redirect-following header grading, timeout-bound DNS, IP
+SAN coverage — plus the report renderer. Two P1 crash bugs found, both
+fixed in this round; the v1.1.0 features themselves held up.
+
+## Findings
+
+1. **[Fixed, P1] A hostile redirect crashed the whole scan.** Three
+   shapes of `Location` header escaped `fetch_headers` as uncaught
+   exceptions, propagated through `future.result()` in `main`, and
+   killed the batch with a traceback (exit 1, no report, no JSON):
+   `Location: http://127.0.0.1:99999/` → `ValueError: Port out of
+   range 0-65535` (from `urlsplit().port`, outside the try block);
+   `Location: http://[::1/` → `ValueError: Invalid IPv6 URL` (from
+   `urljoin`/`hostname`); `Location: /café` → `UnicodeEncodeError`
+   (non-ASCII request-target in `http.client`). Fix: the per-hop URL
+   decomposition is wrapped in `try/except ValueError` (clean
+   per-target error), the request `except` tuple gains `ValueError`,
+   and `urljoin` is wrapped too. Regression tests for all three
+   shapes, plus an end-to-end CLI test (rc 0, JSON written).
+2. **[Fixed, P1] Rich markup injection crashed report rendering.**
+   `render_rich` fed server-supplied strings to rich as markup:
+   a header value of `[/link]` (via the `X-Frame-Options has unusual
+   value: ...` finding) raised `rich.errors.MarkupError` in
+   `console.print(details)` — CLI exit 1 *after* the table printed,
+   and the JSON report was lost too (render precedes the JSON write).
+   A `[bold]` value was silently consumed as a style instead. Fix:
+   table cells are literal `rich.text.Text` and the details block is
+   printed with `markup=False`. Regression tests: hostile-markup
+   server end-to-end (rc 0) and a unit test pinning `[/link]`,
+   `[bold]`, and `[SSL: WRONG_VERSION_NUMBER]` verbatim in output.
+3. **[Fixed, P2] Redirect to port 0 silently graded port 80.**
+   `port = parts.port or 80` treated the valid port `0` as missing,
+   so `Location: http://127.0.0.1:0/` was graded from port 80 while
+   `final_url` claimed `:0`. Fix: explicit `is not None` check; port
+   0 is now fetched as port 0 (connection fails, clean error, nothing
+   graded). Regression test with a live port-80 server proving no
+   silent re-targeting.
+4. **[Verified OK] IPv6 IP-SAN coverage.** Live `::1` TLS server with
+   a minted cert carrying IP SAN `::1`: `ip_sans: ["::1"]`, no
+   warning; DNS-only cert on the same target warns `certificate SAN
+   does not include IP ::1`. The v4-mapped-v6 corner (`::ffff:127.0.0.1`
+   SAN vs `127.0.0.1` target) warns — strict octet comparison per
+   RFC 5280, left as-is.
+5. **[Verified OK] DNS timeout behaviour.** Mocked 0.5 s resolver +
+   0.05 s timeout returns `None`; `check_sans` splits dead vs slow
+   names (suite). Negative timeout passed programmatically is
+   harmless (`Thread.join` returns at once → `None`). No change.
+6. **[Fixed, test harness] Unclosed fixture sockets.** `tearDownClass`
+   only called `shutdown()`, leaving listening sockets bound — the
+   port-80 fixture failed to rebind across test classes (test skipped
+   in full runs) and the suite emitted 34 `ResourceWarning`s. Now
+   `server_close()` is called too: 1 warning left (a single socket
+   reaped at interpreter shutdown), no skips.
+
+## Verification
+
+- Suite **44 → 51 tests, all green** (local working tree), including
+  the 7 new regression tests; re-run in a fresh clone of the pushed
+  commit with a new venv + `pip install .`: 51/51 green.
+- Adversarial probes re-run post-fix: bad-port / bad-IPv6 /
+  non-ASCII redirect targets all return clean per-target errors;
+  port-0 redirect returns a connection error with no grading;
+  hostile-markup CLI exits 0 with `[/LINK]` printed literally.
+- No regressions: all 44 pre-existing tests pass unchanged.
+
+## Honest limitations (unchanged from v1.1.0)
+
+- The dangling-SAN check still depends on the system resolver; a
+  resolver that answers for every name will suppress hints. A timed-out
+  lookup leaves a daemon worker thread behind until the resolver
+  answers; threads are bounded by the 20-name cap per target.
+- Header grading is presence + basic strength; it is a triage
+  signal, not a security audit.
+- No cipher-suite or protocol-downgrade testing (testssl.sh's job),
+  no crawling, no active enumeration — by design.
+
+## Verdict
+
+v1.1.1 closes two crash-class holes a hostile server could use to
+deny the whole batch report. The v1.1.0 features (timeout-bound DNS,
+redirect-aware grading, IP SAN coverage) survived adversarial probing
+intact. Solid as a fast, batch-safe TLS + header triage aid.
+
+---
+
 # Audit — llumen v1.1.0 (2026-11-23)
 
 Upgrade build closing the three honest limitations admitted in the
