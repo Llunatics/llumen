@@ -140,7 +140,9 @@ D ≥ 40, F below that. The rubric is a triage signal, not an audit.
 - Redirects are followed up to 5 hops for the header fetch (loops and
   longer chains are errors); the final response is graded and the hop
   count + final URL are recorded. A redirect to a non-HTTP(S) scheme is
-  rejected.
+  rejected, and a malformed redirect target (out-of-range port, broken
+  IPv6, non-ASCII path) is reported as a clean per-target error — a
+  hostile `Location` header can never crash the scan.
 - For IP-literal targets, chain validation runs and the certificate's SAN
   is additionally checked for an IPAddress entry covering the target IP;
   `valid` means "chain verifies *and* the SAN covers this IP".

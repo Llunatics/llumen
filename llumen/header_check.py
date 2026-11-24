@@ -254,17 +254,33 @@ def fetch_headers(
     https_fallback_tried = False
 
     while True:
-        parts = urlsplit(current)
-        host = parts.hostname or target.host
-        port = parts.port or (443 if parts.scheme == "https" else 80)
-        path = parts.path or "/"
-        if parts.query:
-            path += "?" + parts.query
+        try:
+            parts = urlsplit(current)
+            # .hostname/.port raise ValueError on a malformed redirect
+            # target (out-of-range port, broken IPv6 bracket); a hostile
+            # Location header must yield a clean error, never a crash.
+            host = parts.hostname or target.host
+            port = (
+                parts.port
+                if parts.port is not None
+                else (443 if parts.scheme == "https" else 80)
+            )
+            path = parts.path or "/"
+            if parts.query:
+                path += "?" + parts.query
+        except ValueError as exc:
+            result.error = f"invalid URL in redirect chain: {exc}"
+            return result
         try:
             status, headers, location = _request_once(
                 host, port, parts.scheme, method, timeout, path
             )
-        except (http.client.HTTPException, OSError, ssl.SSLError) as exc:
+        except (
+            http.client.HTTPException,
+            OSError,
+            ssl.SSLError,
+            ValueError,  # e.g. UnicodeEncodeError for a non-ASCII path
+        ) as exc:
             # First-hop plain HTTP failed; the port might still speak TLS.
             if (
                 not https_fallback_tried
@@ -287,7 +303,11 @@ def fetch_headers(
             if redirects >= max_redirects:
                 result.error = f"too many redirects (>{max_redirects})"
                 return result
-            nxt = urljoin(current, location)
+            try:
+                nxt = urljoin(current, location)
+            except ValueError as exc:
+                result.error = f"invalid redirect target: {exc}"
+                return result
             if urlsplit(nxt).scheme not in ("http", "https"):
                 result.error = (
                     f"redirect to unsupported scheme: "

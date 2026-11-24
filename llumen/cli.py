@@ -132,6 +132,7 @@ def render_plain(records: list[dict]) -> str:
 def render_rich(records: list[dict]) -> None:
     from rich.console import Console
     from rich.table import Table
+    from rich.text import Text
 
     console = Console()
     table = Table(title="llumen — TLS & header report", show_lines=False)
@@ -147,12 +148,16 @@ def render_rich(records: list[dict]) -> None:
             if tls.get("ok")
             else "-"
         )
+        # Cells are literal Text, not markup: certificate errors and
+        # header values are server-supplied and may contain brackets
+        # (e.g. "[SSL: ...]" or a hostile "[/link]") that rich would
+        # otherwise parse as markup — or raise MarkupError on.
         table.add_row(
-            rec["target"],
-            _cert_cell(rec),
-            tls_txt or "-",
-            tls.get("validation", "-") if tls.get("ok") else "-",
-            _grade_cell(rec),
+            Text(rec["target"]),
+            Text(_cert_cell(rec)),
+            Text(tls_txt or "-"),
+            Text(tls.get("validation", "-") if tls.get("ok") else "-"),
+            Text(_grade_cell(rec)),
         )
     console.print(table)
     details = render_plain(
@@ -167,7 +172,8 @@ def render_rich(records: list[dict]) -> None:
         ]
     )
     if details.strip():
-        console.print(details)
+        # Plain text, not markup: findings embed raw header values.
+        console.print(details, markup=False)
 
 
 def build_parser() -> argparse.ArgumentParser:

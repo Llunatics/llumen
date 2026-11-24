@@ -7,6 +7,7 @@ is required.
 
 from __future__ import annotations
 
+import io
 import ipaddress
 import json
 import socket
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -283,6 +285,94 @@ class FixtureBase(unittest.TestCase):
         cls.port_redirect_chain = cls.http_redirect_chain.server_address[1]
         cls.port_redirect_to_tls = cls.http_redirect_to_tls.server_address[1]
 
+        # Audit 2026-11-24: hostile redirect targets. A single malicious
+        # Location header used to crash the whole scan (ValueError /
+        # UnicodeEncodeError escaping fetch_headers).
+        redirect_bad_port = type(
+            "RedirectBadPort",
+            (RedirectHandler,),
+            {
+                "redirect_map": {"/": (301, "http://127.0.0.1:99999/")},
+                "final_profile": FULL_PROFILE,
+            },
+        )
+        redirect_bad_ipv6 = type(
+            "RedirectBadIpv6",
+            (RedirectHandler,),
+            {
+                "redirect_map": {"/": (301, "http://[::1/")},
+                "final_profile": FULL_PROFILE,
+            },
+        )
+        redirect_non_ascii = type(
+            "RedirectNonAscii",
+            (RedirectHandler,),
+            {
+                "redirect_map": {"/": (301, "/café")},
+                "final_profile": FULL_PROFILE,
+            },
+        )
+        redirect_port_zero = type(
+            "RedirectPortZero",
+            (RedirectHandler,),
+            {
+                "redirect_map": {"/": (301, "http://127.0.0.1:0/")},
+                "final_profile": FULL_PROFILE,
+            },
+        )
+        cls.http_redirect_bad_port = make_server(redirect_bad_port)
+        cls.http_redirect_bad_ipv6 = make_server(redirect_bad_ipv6)
+        cls.http_redirect_non_ascii = make_server(redirect_non_ascii)
+        cls.http_redirect_port_zero = make_server(redirect_port_zero)
+        cls.port_redirect_bad_port = cls.http_redirect_bad_port.server_address[1]
+        cls.port_redirect_bad_ipv6 = cls.http_redirect_bad_ipv6.server_address[1]
+        cls.port_redirect_non_ascii = (
+            cls.http_redirect_non_ascii.server_address[1]
+        )
+        cls.port_redirect_port_zero = (
+            cls.http_redirect_port_zero.server_address[1]
+        )
+
+        # Audit 2026-11-24: server that answers on port 80, so the
+        # port-zero test can prove a ":0" redirect is not silently
+        # re-targeted at port 80. Binding port 80 needs privileges;
+        # the test skips when it is unavailable.
+        cls.http_port80 = None
+        try:
+            full80 = type(
+                "Full80",
+                (HeaderHandler,),
+                {
+                    "profile": FULL_PROFILE,
+                    "server_version": "nginx",
+                    "sys_version": "",
+                },
+            )
+            srv80 = ThreadingHTTPServer(("127.0.0.1", 80), full80)
+            threading.Thread(target=srv80.serve_forever, daemon=True).start()
+            cls.http_port80 = srv80
+        except OSError:
+            cls.http_port80 = None
+
+        # Audit 2026-11-24: hostile rich-markup in a header value. The
+        # X-Frame-Options value is embedded verbatim in a finding, and
+        # render_rich used to feed it to rich as markup — "[/link]"
+        # raised MarkupError and crashed the whole report.
+        hostile_markup = type(
+            "HostileMarkup",
+            (HeaderHandler,),
+            {
+                "profile": {
+                    **FULL_PROFILE,
+                    "X-Frame-Options": "[/link]",
+                },
+                "server_version": "nginx",
+                "sys_version": "",
+            },
+        )
+        cls.http_hostile_markup = make_server(hostile_markup)
+        cls.port_hostile_markup = cls.http_hostile_markup.server_address[1]
+
     @classmethod
     def tearDownClass(cls):
         for srv in (
@@ -294,8 +384,17 @@ class FixtureBase(unittest.TestCase):
             cls.http_redirect_loop,
             cls.http_redirect_chain,
             cls.http_redirect_to_tls,
+            cls.http_redirect_bad_port,
+            cls.http_redirect_bad_ipv6,
+            cls.http_redirect_non_ascii,
+            cls.http_redirect_port_zero,
+            cls.http_hostile_markup,
         ):
             srv.shutdown()
+            srv.server_close()
+        if cls.http_port80 is not None:
+            cls.http_port80.shutdown()
+            cls.http_port80.server_close()
 
 
 # ---------------------------------------------------------------- targets
@@ -555,6 +654,46 @@ class TestFetchHeaders(FixtureBase):
         self.assertFalse(result.ok)
         self.assertIn("too many redirects", result.error)
 
+    def test_redirect_bad_port_returns_clean_error(self):
+        # Audit 2026-11-24: Location with an out-of-range port used to
+        # raise ValueError out of fetch_headers and crash the scan.
+        result = fetch_headers(
+            Target("127.0.0.1", self.port_redirect_bad_port), scheme="http"
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("Port out of range", result.error)
+
+    def test_redirect_bad_ipv6_returns_clean_error(self):
+        # Audit 2026-11-24: Location with a broken IPv6 bracket used to
+        # raise ValueError out of fetch_headers and crash the scan.
+        result = fetch_headers(
+            Target("127.0.0.1", self.port_redirect_bad_ipv6), scheme="http"
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("Invalid IPv6", result.error)
+
+    def test_redirect_non_ascii_path_returns_clean_error(self):
+        # Audit 2026-11-24: Location with a non-ASCII path used to raise
+        # UnicodeEncodeError out of fetch_headers and crash the scan.
+        result = fetch_headers(
+            Target("127.0.0.1", self.port_redirect_non_ascii), scheme="http"
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("ascii", result.error)
+
+    def test_redirect_port_zero_is_not_remapped_to_80(self):
+        # Audit 2026-11-24: "port = parts.port or 80" silently graded
+        # port 80 while final_url claimed ":0". Now port 0 is fetched
+        # as port 0 (connection fails) and nothing is graded.
+        if self.http_port80 is None:
+            self.skipTest("port 80 unavailable in this environment")
+        result = fetch_headers(
+            Target("127.0.0.1", self.port_redirect_port_zero), scheme="http"
+        )
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.score)
+        self.assertIsNone(result.final_url)
+
     def test_drip_feed_body_does_not_stall_fetch(self):
         # Regression (audit round 1): the GET fallback used to drain the
         # response body, so a slow-drip server stalled the scan forever.
@@ -693,6 +832,82 @@ class TestCli(FixtureBase):
     def test_bad_port_returns_2(self):
         self.assertEqual(cli.main(["example.com", "--port", "70000"]), 2)
         self.assertEqual(cli.main(["example.com", "--port", "0"]), 2)
+
+    def test_hostile_redirect_cli_still_reports(self):
+        # Audit 2026-11-24: a redirect to an out-of-range port used to
+        # crash the CLI with a traceback (exit 1, no report). Now the
+        # target is recorded with a clean error and the JSON is written.
+        out = self.tmp / "hostile-redirect.json"
+        with redirect_stdout(io.StringIO()):
+            rc = cli.main(
+                [
+                    f"127.0.0.1:{self.port_redirect_bad_port}",
+                    "--scheme",
+                    "http",
+                    "--no-dns-check",
+                    "--json",
+                    str(out),
+                ]
+            )
+        self.assertEqual(rc, 0)
+        records = json.loads(out.read_text())
+        self.assertEqual(len(records), 1)
+        self.assertFalse(records[0]["headers"]["ok"])
+        self.assertIn("Port out of range", records[0]["headers"]["error"])
+
+    def test_hostile_markup_cli_does_not_crash(self):
+        # Audit 2026-11-24: a header value of "[/link]" used to raise
+        # rich MarkupError inside render_rich (exit 1, no report).
+        with redirect_stdout(io.StringIO()):
+            rc = cli.main(
+                [
+                    f"127.0.0.1:{self.port_hostile_markup}",
+                    "--scheme",
+                    "http",
+                    "--no-dns-check",
+                ]
+            )
+        self.assertEqual(rc, 0)
+
+    def test_render_rich_keeps_markup_literal(self):
+        # Audit 2026-11-24: server-supplied brackets must reach the
+        # terminal verbatim — "[bold]" was silently consumed as a style
+        # and "[/link]" crashed the renderer.
+        record = {
+            "target": "127.0.0.1:1",
+            "tls": {
+                "ok": False,
+                "error": "TLS error: [SSL: WRONG_VERSION_NUMBER] "
+                "wrong version number",
+                "warnings": [],
+                "tls_version": "",
+                "cipher": "",
+                "validation": "-",
+                "cert": None,
+            },
+            "headers": {
+                "ok": True,
+                "grade": "B",
+                "score": 82,
+                "scheme": "http",
+                "status": 200,
+                "findings": [
+                    "X-Frame-Options has unusual value: '[/link]'",
+                    "note with [bold] style tag",
+                ],
+                "redirects": 0,
+                "final_url": None,
+            },
+            "takeover_hints": [],
+            "dns_timeouts": [],
+        }
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli.render_rich([record])
+        output = buf.getvalue()
+        self.assertIn("[/link]", output)
+        self.assertIn("[bold]", output)
+        self.assertIn("[SSL: WRONG_VERSION_NUMBER]", output)
 
 
 if __name__ == "__main__":
